@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weightdiff"
+version = "0.1.0"
+description = "Compare Hugging Face model structure and bounded byte samples"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = ["gradio==6.31.0", "huggingface_hub==2.4.0", "requests==2.34.2", "numpy==2.5.3"]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1", "safetensors==0.8.0"]
+
+[project.scripts]
+weightdiff = "weightdiff.application.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
