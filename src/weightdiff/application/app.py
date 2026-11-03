@@ -8,7 +8,7 @@ import gradio as gr
 
 from .collect import build_report
 from .report import (DISCLAIMER, position_notes, flags_markdown, layer_rows, metric_cards,
-                     overview_markdown, read_footer, samples_markdown, tensor_rows, to_json, quantization_markdown)
+                     overview_markdown, regions_markdown, read_footer, samples_markdown, tensor_rows, to_json, quantization_markdown)
 
 DASHBOARD_CSS = '''
 .gradio-container {
@@ -138,7 +138,7 @@ def compare(a, b, rev_a, rev_b, sample, progress=gr.Progress()):
     if not a.strip() or not b.strip():
         raise gr.Error('Enter both model references.')
     try:
-        report = build_report(a.strip(), b.strip(), rev_a.strip() or None, rev_b.strip() or None,
+        report = build_report(a.strip(), b.strip(), (rev_a or '').strip() or None, (rev_b or '').strip() or None,
                               sample=sample, progress=progress)
     except Exception as exc:
         raise gr.Error(f'Comparison could not complete: {exc}') from exc
@@ -157,7 +157,7 @@ def compare(a, b, rev_a, rev_b, sample, progress=gr.Progress()):
     return (metric_cards(report), overview_markdown(report) + ('\n\n' + quantization_markdown(report) if report.a.format == 'gguf' or report.b.format == 'gguf' else ''), flags_markdown(report),
             layer_rows(report, changed_limit=8), position_notes(report), tensor_rows(report)[:50], tensor_note,
             [[c.key, str(c.a_value), str(c.b_value), c.kind] for c in report.config_diff],
-            files, samples_markdown(report), download, read_footer(report))
+            files, samples_markdown(report), regions_markdown(report), download, read_footer(report))
 
 
 with gr.Blocks(title='weightdiff', analytics_enabled=False) as demo:
@@ -188,7 +188,7 @@ with gr.Blocks(title='weightdiff', analytics_enabled=False) as demo:
     gr.Markdown('## Points to note')
     flags = gr.Markdown(elem_id='wd-flags')
     with gr.Accordion('Layers', open=False):
-        layers = gr.Dataframe(label='Layers', headers=['Stack', 'A', 'B', 'Added', 'Removed', 'Added positions (B)', 'Removed positions (A)', 'Changed (A, B)', 'Fingerprints (A / B)', 'Pairing'], interactive=False)
+        layers = gr.Dataframe(label='Layers', headers=['Stack', 'A', 'B', 'Added', 'Removed', 'Added positions (B)', 'Removed positions (A)', 'Changed (A, B)', 'Fingerprints (A / B)', 'Pairing', 'Position basis'], interactive=False)
         positions = gr.Markdown()
     with gr.Accordion('Tensor differences', open=False):
         tensor_note = gr.Markdown()
@@ -199,9 +199,11 @@ with gr.Blocks(title='weightdiff', analytics_enabled=False) as demo:
         files = gr.Dataframe(label='File differences', headers=['Change', 'File'], interactive=False)
     with gr.Accordion('Sampled values', open=False):
         samples = gr.Markdown()
+    with gr.Accordion('New regions in B / B で新しく増えた部分', open=False):
+        regions = gr.Markdown()
     download = gr.File(label='Download JSON', interactive=False)
     footer = gr.HTML(elem_id='wd-footer')
-    outputs = [cards, summary, flags, layers, positions, tensors, tensor_note, config, files, samples, download, footer]
+    outputs = [cards, summary, flags, layers, positions, tensors, tensor_note, config, files, samples, regions, download, footer]
     run.click(compare, [a, b, rev_a, rev_b, sample], outputs, concurrency_limit=1)
     for button, left, right in examples:
         button.click(lambda left=left, right=right: (left, right, '', ''), outputs=[a, b, rev_a, rev_b], queue=False).then(

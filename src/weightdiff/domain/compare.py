@@ -6,7 +6,8 @@ import numpy as np
 
 from .quant import plan_quant_sample
 from .layers import layer_parts
-from .model import AxisChange, ConfigChange, FileDiff, SamplePlan, SampleResult, TensorDiff
+from .shapes import is_wider
+from .model import AxisChange, ConfigChange, FileDiff, SamplePlan, SampleResult, TensorDiff, RegionPlan, RegionStats
 
 PRIORITY = ('architectures', 'model_type', 'num_hidden_layers', 'text_config.num_hidden_layers',
             'hidden_size', 'text_config.hidden_size', 'intermediate_size', 'vocab_size',
@@ -117,13 +118,14 @@ def _aligned_pairs(a, b, name_pairs, layer_summary):
 
 def sample_pairs(a, b, tensor_diff, layer_summary):
     pairs = _aligned_pairs(a, b, tensor_diff.name_pairs, layer_summary)
+    config = a.config or {}
+    tied = config.get('tie_word_embeddings', (config.get('text_config') or {}).get('tie_word_embeddings', False))
+    if tied and 'lm_head.weight' in tensor_diff.only_b:
+        embeddings = sorted(n for n in a.tensors if n.endswith('embed_tokens.weight'))
+        if embeddings:
+            pairs.append((embeddings[0], 'lm_head.weight'))
     return [(na, nb) for na, nb in pairs if a.tensors[na].shape == b.tensors[nb].shape
             or is_wider(a.tensors[na].shape, b.tensors[nb].shape)]
-
-
-def is_wider(a_shape, b_shape):
-    return (len(a_shape) == len(b_shape) and a_shape != b_shape
-            and all(y >= x for x, y in zip(a_shape, b_shape)))
 
 
 FLOAT_SIZES = {'F32': 4, 'F16': 2, 'BF16': 2}
@@ -188,7 +190,7 @@ def plan_samples(a, b, same_meta, max_tensors=160, layer_summary=()) -> list[Sam
                                 ar, tb.file, br,
                                 ta.dtype, tb.dtype, stack.prefix if stack else None,
                                 (pa[1], pb[1]) if stack else None, reason,
-                                'top_left' if top_left else 'values'))
+                                'top_left' if top_left else 'values', tensor_shape=ta.shape))
     return plans
 
 
@@ -198,9 +200,10 @@ def _float32(data, dtype):
     return np.frombuffer(data, dtype='<f2' if dtype == 'F16' else '<f4').astype(np.float32)
 
 
-def compare_samples(plan, bytes_a, bytes_b) -> SampleResult:
+def compare_samples(plan, bytes_a, bytes_b, width_map=None) -> SampleResult:
+    maxima = {}
     def result(status, reason):
-        return SampleResult(plan.name, status, reason, plan.stack_prefix, plan.layer_pair)
+        return SampleResult(plan.name, status, reason, plan.stack_prefix, plan.layer_pair, **maxima)
     if plan.skip_reason:
         return result('skipped', plan.skip_reason)
     for label, data, ranges in [('a', bytes_a, plan.a_ranges), ('b', bytes_b, plan.b_ranges)]:
@@ -208,6 +211,10 @@ def compare_samples(plan, bytes_a, bytes_b) -> SampleResult:
             return result('skipped', f'{label}: {data or "bytes unavailable"}')
         if len(data) != len(ranges) or any(len(chunk) != length for chunk, (_, length) in zip(data, ranges)):
             return result('skipped', f'{label}: incomplete byte ranges')
+    va = _float32(b''.join(bytes_a), plan.a_dtype)
+    vb = _float32(b''.join(bytes_b), plan.b_dtype)
+    maxima = dict(max_abs_a=float(np.max(np.abs(va))) if va.size else 0.,
+                  max_abs_b=float(np.max(np.abs(vb))) if vb.size else 0.)
     if plan.a_dtype == plan.b_dtype:
         same = bytes_a == bytes_b
         reason = f'{sum(map(len, bytes_a)):,} sampled bytes per model are ' + ('identical' if same else 'different')
@@ -221,6 +228,22 @@ def compare_samples(plan, bytes_a, bytes_b) -> SampleResult:
             same = bool(np.all((va == vb) | (np.isfinite(va) & np.isfinite(vb) & within_tolerance)))
         reason = ('Sampled values are the same (within dtype-conversion rounding) / '
                   '抜き取った値は同じ（型の変換の丸めの範囲）' if same else 'Values differ (have been rewritten)')
+    # A uniform scale needs multiple observations; retain exact scalar semantics.
+    if (not same and len(plan.tensor_shape) == 1 and va.shape == vb.shape and va.size >= 2
+            and np.all(np.isfinite(va)) and np.all(np.isfinite(vb))):
+        for shifted in (False, True):
+            aa, bb = (1 + va, 1 + vb) if shifted else (va, vb)
+            valid = np.abs(aa) > 1e-3
+            if not np.any(valid): continue
+            c = float(np.median(bb[valid] / aa[valid]))
+            if not np.isfinite(c): continue
+            if np.all(np.abs(bb - c * aa) <= 2**-7 * np.abs(bb) + 2**-14):
+                reason = f'(1+w) の形で ×{c:.6g}' if shifted else f'×{c:.6g} で一様に縮めた'
+                for x, y in (width_map or {}).items():
+                    if abs(c - (x/y)**.5) < 1e-3:
+                        reason += f'; 幅 {x}→{y} の変化を打ち消す縮め（RMS 正規化）と一致'
+                return SampleResult(plan.name, 'rescaled', reason, plan.stack_prefix, plan.layer_pair,
+                                    scale=c, **maxima)
     if plan.mode == 'top_left':
         return result('embedded_top_left' if same else 'not_top_left',
                       'Sampled A values found in the top-left block of B' if same else
@@ -231,3 +254,66 @@ def compare_samples(plan, bytes_a, bytes_b) -> SampleResult:
 
 def diff_files(a, b) -> FileDiff:
     return FileDiff(tuple(sorted(set(a) - set(b))), tuple(sorted(set(b) - set(a))))
+
+
+def _element_ranges(t, count=None):
+    count = prod(t.shape) if count is None else count
+    size = FLOAT_SIZES[t.dtype]
+    return (((t.data_start, min(2048, count)*size),) if count else ()) + (
+        ((t.data_start + (count//2-1024)*size, 2048*size),) if count > 8192 else ())
+
+
+def plan_regions(a, b, tensor_diff, layer_summary, max_regions=160):
+    if max_regions < 0: raise ValueError('max_regions must be nonnegative')
+    if not max_regions or b.format != 'safetensors': return []
+    plans = []
+    def add(t, region, windows):
+        if t.dtype not in FLOAT_SIZES: return
+        size = FLOAT_SIZES[t.dtype]
+        ranges = tuple((t.data_start + start*size, count*size) for start,count in windows if count)
+        if ranges: plans.append(RegionPlan(t.name, region, t.file, ranges, t.dtype))
+    if a.format == 'safetensors':
+        for na, nb in sample_pairs(a,b,tensor_diff,layer_summary):
+            ta, tb = a.tensors[na], b.tensors[nb]
+            if not is_wider(ta.shape,tb.shape): continue
+            if len(ta.shape) == 2:
+                rows, cols = ta.shape
+                br, bc = tb.shape
+                if bc > cols:
+                    add(tb,'extra_columns',[(i*bc+cols,min(2048,bc-cols)) for i in sorted({0,rows//2,rows-1}) if 0<=i<rows])
+                if br > rows:
+                    columns = [(0,bc)] if bc <= 8192 else [(0,2048),(bc-2048,2048)]
+                    add(tb,'extra_rows',[(rows*bc+start,count) for start,count in columns])
+            elif len(ta.shape) == 1:
+                add(tb,'extra_elements',[(ta.shape[0],min(2048,tb.shape[0]-ta.shape[0]))])
+    paired_b = {nb for _, nb in _aligned_pairs(a,b,tensor_diff.name_pairs,layer_summary)}
+    paired_b.update(nb for _, nb in sample_pairs(a,b,tensor_diff,layer_summary))
+    new = set(tensor_diff.only_b)
+    for name in b.tensors:
+        parts = layer_parts(name)
+        if not parts: continue
+        for stack in layer_summary:
+            if parts[0] == stack.b_prefix:
+                if parts[1] in stack.added or (not stack.a_count): new.add(name)
+                # Ambiguous repeated layers are not labelled as new without a known position.
+    new.difference_update(paired_b)
+    for name in sorted(new):
+        t = b.tensors[name]
+        if t.dtype in FLOAT_SIZES:
+            plans.append(RegionPlan(name,'new_tensor',t.file,_element_ranges(t),t.dtype))
+    plans.sort(key=lambda p:(p.name,p.region))
+    priority = [p for p in plans if p.region == 'new_tensor' or layer_parts(p.name) is None]
+    remaining = [p for p in plans if p.region != 'new_tensor' and layer_parts(p.name) is not None]
+    slots = max(0, max_regions - len(priority))
+    n = len(remaining)
+    if n > slots:
+        remaining = [remaining[min(n-1,round(k*n/slots))] for k in range(slots)]
+    return sorted(priority + remaining,key=lambda p:(p.name,p.region))
+
+
+def region_stats(plan, data):
+    if len(data) != len(plan.ranges) or any(len(chunk)!=length for chunk,(_,length) in zip(data,plan.ranges)):
+        raise ValueError('Incomplete new-region byte ranges')
+    values = _float32(b''.join(data),plan.dtype)
+    return RegionStats(plan.name,plan.region,int(values.size),float(np.mean(values==0)) if values.size else 0.,
+                       float(np.max(np.abs(values))) if values.size else 0.,bool(np.all(np.isfinite(values))))

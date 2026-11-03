@@ -13,7 +13,7 @@ UNKNOWN_NAME_POSITION = 'Added layers have existing name fingerprints, so their 
 
 def position_notes(report):
     return '\n\n'.join(text for basis, text in [('shape', UNKNOWN_POSITION), ('name', UNKNOWN_NAME_POSITION)]
-                         if any(not s.position_known and s.pairing_basis == basis for s in report.layer_summary))
+                         if any(not s.position_known and (s.pairing_basis == basis or (basis == 'shape' and s.pairing_basis == 'width')) for s in report.layer_summary))
 
 
 def _cell(value):
@@ -60,7 +60,8 @@ def layer_rows(report, changed_limit=None):
                      ('Name correspondence (GGUF); dtype/shape ignored for alignment'
                       if report.a.format == 'gguf' or report.b.format == 'gguf' else
                       'Paired by names (shapes differ) / 名前で組（形が違う）')
-                     if layer.pairing_basis == 'name' else 'Shape fingerprints'])
+                     if layer.pairing_basis == 'name' else ('Width-normalized fingerprints (suffix and shape; dtype ignored)' if layer.pairing_basis == 'width' else 'Shape fingerprints'),
+                     f'{layer.position_basis}: ' + ('値で確定 / confirmed by sampled values' if layer.position_basis == 'samples' else '形だけ、あいまい / structure only; repeated shapes are ambiguous')])
     return rows
 
 
@@ -120,14 +121,15 @@ def overview_sentences(report):
     for stack, paired, counts in stack_sample_counts(report):
         name = stack.b_prefix or stack.a_prefix
         basis = 'name' if stack.pairing_basis == 'name' else 'shape'
+        if stack.position_basis == 'samples': basis = 'samples'
         if stack.b_count > stack.a_count:
-            positions = (f'positions {_positions(stack.added)}, new layer {basis}'
+            positions = (f'positions {_positions(stack.added)}, confirmed by samples' if stack.position_basis == 'samples' else f'positions {_positions(stack.added)}, new layer {basis}'
                          if stack.position_known else f'positions unknown from {basis}s')
             parts.append(f'B has {stack.b_count - stack.a_count} more layers than A in {name} '
                          f'(A {stack.a_count}, B {stack.b_count}; {positions}).')
         elif stack.b_count < stack.a_count:
             parts.append(f'B has {stack.a_count - stack.b_count} fewer layers than A in {name} '
-                         f'(A {stack.a_count}, B {stack.b_count}).')
+                         f'(A {stack.a_count}, B {stack.b_count}; removed positions {_positions(stack.removed) if stack.position_known else "unknown"}, {stack.position_basis}).')
         else:
             parts.append(f'A and B each have {stack.a_count} layers in {name}.')
         if paired and (report.a.format == 'gguf' or report.b.format == 'gguf'):
@@ -139,7 +141,7 @@ def overview_sentences(report):
                          f'{counts["different"]} byte-different, {counts["skipped"]} skipped.')
         elif paired:
             parts.append(f'{paired} layers pair with A\'s layers; sampled values: '
-                         f'{counts["same"]} same, {counts["different"]} different, {counts["skipped"]} skipped.')
+                         f'{counts["same"]} same, {counts["different"] + counts["rescaled"]} different (rescaled {counts["rescaled"]}), {counts["skipped"]} skipped.')
             if counts['embedded_top_left'] or counts['not_top_left']:
                 parts.append(f'Paired-layer top-left samples: {counts["embedded_top_left"]} embedded_top_left, '
                              f'{counts["not_top_left"]} not_top_left.')
@@ -152,7 +154,7 @@ def overview_sentences(report):
         parts.append('Sampled A tensors found as the top-left block of the wider B tensor: '
                      f'{samples["embedded_top_left"]} of {top_left_total}.')
     parts.append(f'Total sampled tensors: {len(report.samples)} of {report.sample_candidates}; '
-                 f'{samples["same"]} same, {samples["different"]} different, {samples["skipped"]} skipped'
+                 f'{samples["same"]} same, {samples["different"] + samples["rescaled"]} different (rescaled {samples["rescaled"]}), {samples["skipped"]} skipped'
                  + (f', {samples["embedded_top_left"]} embedded_top_left, {samples["not_top_left"]} not_top_left.'
                     if top_left_total else '.')
                  if report.sampling_enabled else 'Sampling disabled; no values were compared.')
@@ -163,6 +165,11 @@ def overview_sentences(report):
                          f'({beyond} isolated, {uniform} uniform across sampled layers).')
         parts.append('Quantized samples: ' + quantization_counts(report) + '.')
         parts.append(f'Name correspondence unavailable: A {len(report.a.unmapped_names)}, B {len(report.b.unmapped_names)} tensors.')
+    if report.new_regions:
+        used = sum(r.region.startswith('extra_') and r.zero_fraction<1 for r in report.new_regions)
+        notices = [f for f in report.flags if f.title.startswith(('普通の重み','ほとんど 0'))]
+        parts.append(f'New B regions sampled: {len(report.new_regions)}; widened regions in use: {used}; '
+                     f'new-region notices: {len(notices)}.')
     return parts
 
 
@@ -195,15 +202,16 @@ def metric_cards(report):
     width_value = str(wa) if wa == wb and wa is not None else f'{wa if wa is not None else "—"} → {wb if wb is not None else "—"}'
     width_detail = 'hidden size changed' if width_changed else ('unchanged' if wa is not None else 'unavailable')
     counts = Counter(s.status for s in report.samples)
-    sample_detail = f'same {counts["same"]} · different {counts["different"]}'
+    differences = counts["different"] + counts["rescaled"]
+    sample_detail = f'same {counts["same"]} · different {differences} · rescaled {counts["rescaled"]}'
     wider = counts['embedded_top_left'] + counts['not_top_left']
     if wider:
         sample_title = 'Original values inside'
         sample_value = f'{counts["embedded_top_left"]} / {wider}'
-        sample_detail = f'found in the top-left of wider tensors · different {counts["different"]}'
+        sample_detail = f'found in the top-left of wider tensors · different {differences} · rescaled {counts["rescaled"]}'
     else:
         sample_title = 'Sampled values'
-        sample_value = str(counts['different'])
+        sample_value = str(differences)
     if report.a.format == 'gguf' or report.b.format == 'gguf':
         sample_title = 'Quantized values'
         sample_value = str(counts['beyond_quant_noise'] + counts['systematic'])
@@ -215,7 +223,7 @@ def metric_cards(report):
         ('Layers', layers, layer_detail, bool(delta)),
         ('Width', width_value, width_detail, width_changed),
         (sample_title, sample_value, sample_detail,
-         counts['different'] > 0 or counts['beyond_quant_noise'] + counts['systematic'] > 0),
+         differences > 0 or counts['beyond_quant_noise'] + counts['systematic'] > 0),
         ('Points to note', str(len(notices)), _flag_title(notices[0]) if notices else 'No notices', bool(notices)),
     ]
     html = ['<div class="wd-metrics" aria-label="Comparison summary">']
@@ -242,12 +250,12 @@ def summary_markdown(report):
         f'- **Parameters:** A {d.a_parameters:,} · B {d.b_parameters:,}',
         f'- **Layers:** {_cell(layers)}',
         f'- **Differences:** {len(report.config_diff)} config keys · {changed} tensor names · {d.renamed_count} name locations changed · {len(report.file_diff.only_a)+len(report.file_diff.only_b)} file paths',
-        f'- **Samples:** {len(report.samples)} of {report.sample_candidates} tensors · {samples["same"]} same · {samples["different"]} different · {samples["skipped"]} skipped · {samples["embedded_top_left"]} embedded_top_left · {samples["not_top_left"]} not_top_left',
+        f'- **Samples:** {len(report.samples)} of {report.sample_candidates} tensors · {samples["same"]} same · {samples["different"] + samples["rescaled"]} different · rescaled {samples["rescaled"]} · {samples["skipped"]} skipped · {samples["embedded_top_left"]} embedded_top_left · {samples["not_top_left"]} not_top_left',
         f'- **Read:** {report.read_stats.get("total_bytes",0):,} bytes · {report.elapsed_seconds:.2f} seconds '
-        f'({report.read_stats.get("header_bytes",0):,} header + {report.read_stats.get("sample_bytes",0):,} sample + {report.read_stats.get("small_file_bytes",0):,} small-file bytes)',
+        f'({report.read_stats.get("header_bytes",0):,} header + {report.read_stats.get("sample_bytes",0):,} sample + {report.read_stats.get("small_file_bytes",0):,} small-file + {report.read_stats.get("region_bytes",0):,} new-region + {report.read_stats.get("position_bytes",0):,} position-probe bytes)',
     ]
     lines += [f'- **{_cell(s.prefix)}:** {paired} layers paired with A; sampled values: '
-              f'{counts["same"]} same / {counts["different"]} different / {counts["skipped"]} skipped / '
+              f'{counts["same"]} same / {counts["different"] + counts["rescaled"]} different / rescaled {counts["rescaled"]} / {counts["skipped"]} skipped / '
               f'{counts["embedded_top_left"]} embedded_top_left / {counts["not_top_left"]} not_top_left'
               for s, paired, counts in stack_sample_counts(report)]
     if report.a.format == 'gguf' or report.b.format == 'gguf':
@@ -265,12 +273,20 @@ def _flag_title(flag):
         '読み込むとコードが動きうる形式': 'A file format that can execute code when loaded',
         '読み込みに trust_remote_code が要る（リポジトリのコードが動く）': 'Loading requires trust_remote_code (repository code executes)',
         '会話の書式が違う': 'Chat formatting differs',
+        '会話の書式は同じ（置き場所だけ違う）': 'Chat formatting is the same (storage location differs)',
+        '普通の重みではありえない大きさの値': 'Values exceed ordinary weight magnitudes',
+        'ほとんど 0 の新しい重み（学習した重みには見えない。手で置いたか、0 で初期化した物）': 'New weights are almost zero (may be hand-set or zero-initialized)',
         '語彙の数が違う': 'Vocabulary sizes differ',
         '追加トークンの数が違う': 'Added-token counts differ',
         'safetensors が無いので、この道具では中身を比べられません': 'No safetensors: this tool cannot compare the contents',
     }
     if title in translations:
         return translations[title]
+    for prefix, english in [('広げた部分が使われている', 'Widened regions are in use'),
+                            ('広げた部分は 0 埋め', 'Sampled widened regions are zero-filled')]:
+        if title.startswith(prefix):
+            count = title[len(prefix):].removeprefix('（').removesuffix(' 領域）')
+            return f'{english} ({count} regions)'
     if title.startswith('層の数が違う'):
         return title.replace('層の数が違う', 'Layer counts differ').replace('（', ' (').replace('）', ')').replace('、', ', ')
     if title.startswith('値が書き換えられたテンソルが '):
@@ -335,6 +351,7 @@ def samples_markdown(report):
                     'embedded_top_left means these sampled values matched; not_top_left means not found in the '
                     'top-left block (other placements have not been checked).\n\n')
     nonmatching = [(s.name, s.status, s.reason) for s in report.samples if s.status != 'same']
+    description += 'rescaled is counted as a difference; the sampled 1D values fit a uniform scale (direct or 1+w).\n\n'
     description += (_table(['Tensor', 'Result', 'Detail'], nonmatching) if nonmatching
                     else 'All sampled tensors matched under the comparison rules above.')
     return description
@@ -347,17 +364,25 @@ def to_markdown(report):
              'Read bytes count file payloads actually inspected, including cached small files; HTTP headers and Hub API listings are excluded. '
              'Only headers and bounded samples of weight files are read; full weight files are never downloaded.',
              '## Points to note', flags_markdown(report), '## Layers',
-             _table(['Stack', 'A', 'B', 'Added', 'Removed', 'Added positions (B)', 'Removed positions (A)', 'Changed (A, B)', 'Fingerprints (A / B)', 'Pairing'], layer_rows(report))]
+             _table(['Stack', 'A', 'B', 'Added', 'Removed', 'Added positions (B)', 'Removed positions (A)', 'Changed (A, B)', 'Fingerprints (A / B)', 'Pairing', 'Position basis'], layer_rows(report))]
     if position_notes(report):
         parts.append(position_notes(report))
     parts += ['## Configuration', _table(['Key', 'A', 'B', 'Change'], [(c.key, c.a_value, c.b_value, c.kind) for c in report.config_diff]),
               '## Tensors', f'{d.excluded_by_layer_shift} tensor names excluded because their layer stack changed count. '
               f'Stored tensor bytes: A {d.a_bytes:,}; B {d.b_bytes:,}.',
               _table(['Change', 'Tensor', 'A shape', 'A dtype', 'B shape', 'B dtype'], tensor_rows(report)),
-              '## Samples', samples_markdown(report), '## Files',
+              '## Samples', samples_markdown(report), '## B で新しく増えた部分 / New regions in B', regions_markdown(report), '## Files',
               _table(['Change', 'File'], [('Only B', f) for f in report.file_diff.only_b] + [('Only A', f) for f in report.file_diff.only_a])]
     return '\n\n'.join(parts) + '\n'
 
 
 def to_json(report):
     return json.dumps(asdict(report), ensure_ascii=False, indent=2, sort_keys=True) + '\n'
+
+
+def regions_markdown(report):
+    if not report.sampling_enabled: return 'Sampling disabled. No new regions were read.'
+    rows = [(r.name,r.region,r.count,f'{r.zero_fraction:.6g}',f'{r.max_abs:.8g}',r.finite)
+            for r in sorted(report.new_regions,key=lambda r:(-r.max_abs,r.name,r.region))]
+    return 'Bounded samples only; zeros and maxima describe the inspected elements.\n\n' + _table(
+        ['Tensor','Region','Count','Zero fraction','Max absolute value','All finite'],rows)

@@ -1,8 +1,11 @@
 import re
 from collections import Counter, defaultdict
+from dataclasses import replace
 from difflib import SequenceMatcher
 
-from .model import FingerprintCount, LayerStackSummary, ModelSnapshot
+from .model import FingerprintCount, LayerStackSummary, ModelSnapshot, Run
+
+from .shapes import is_wider
 
 LAYER = re.compile(r'(^|\.)(?:layers|blk)\.(\d+)\.')
 
@@ -34,6 +37,12 @@ def _stacks(snapshot):
             for prefix, layers in stacks.items()}
 
 
+def _width_fingerprints(layers, inverse):
+    # Dtype conversion is checked by value sampling, not structural alignment.
+    return [(n, tuple((suffix, tuple(inverse.get(v, v) for v in shape))
+                      for suffix, _, shape in fp)) for n, fp in layers]
+
+
 def summarize_layers(a: ModelSnapshot, b: ModelSnapshot) -> list[LayerStackSummary]:
     stacks_a, stacks_b = _stacks(a), _stacks(b)
     common = stacks_a.keys() & stacks_b.keys()
@@ -61,6 +70,8 @@ def summarize_layers(a: ModelSnapshot, b: ModelSnapshot) -> list[LayerStackSumma
                 unmatched_b.remove(pb)
     pairs.extend((p, None) for p in sorted(unmatched_a))
     pairs.extend((None, p) for p in sorted(unmatched_b))
+    widths = axis_map(a, b)
+    inverse = {y: x for x, y in widths.items()}
     result = []
     for pa, pb in sorted(pairs, key=lambda pair: (pair[0] or pair[1], pair[1] or '')):
         prefix = f'{pa} → {pb}' if pa and pb and pa != pb else pa or pb
@@ -68,6 +79,15 @@ def summarize_layers(a: ModelSnapshot, b: ModelSnapshot) -> list[LayerStackSumma
         names_only = (pa, pb) in name_pairs
         if a.format == 'gguf' or b.format == 'gguf':
             names_only = bool(pa and pb)
+        basis = 'name' if names_only else 'shape'
+        if a.format == b.format == 'safetensors' and pa and pb and widths:
+            raw_a, raw_b = [f for _, f in la], [f for _, f in lb]
+            width_a = _width_fingerprints(la, {})
+            restored = _width_fingerprints(lb, inverse)
+            count = lambda x, y: sum(block.size for block in SequenceMatcher(None, x, y, autojunk=False).get_matching_blocks())
+            original_count = count(raw_a, raw_b)
+            if original_count < min(len(la), len(lb)) // 2 and count([f for _, f in width_a], [f for _, f in restored]) > original_count:
+                la, lb, names_only, basis = width_a, restored, False, 'width'
         if names_only:
             la, lb = fingerprints(la, True), fingerprints(lb, True)
         fa, fb = [x[1] for x in la], [x[1] for x in lb]
@@ -95,10 +115,95 @@ def summarize_layers(a: ModelSnapshot, b: ModelSnapshot) -> list[LayerStackSumma
                 retained_added.append(number)
                 retained_fingerprints.append(fingerprint)
         added, inserted = retained_added, retained_fingerprints
-        known = not inserted or not all(f in ca for f in inserted)
+        known = ((not inserted or not all(f in ca for f in inserted))
+                 and (not removed or not all(removed_fingerprints[n] in cb for n in removed)))
         result.append(LayerStackSummary(
             prefix, len(la), len(lb),
             tuple(FingerprintCount(f, ca[f], cb[f]) for f in sorted(ca.keys() | cb.keys())),
-            len(added), len(removed), tuple(added) if known else (), tuple(removed),
-            tuple(changed), known, pa, pb, tuple(equal_pairs), 'name' if names_only else 'shape'))
+            len(added), len(removed), tuple(added) if known else (), tuple(removed) if known else (),
+            tuple(changed), known, pa, pb, tuple(equal_pairs), basis))
     return result
+
+
+def axis_map(a, b):
+    candidates = defaultdict(set)
+    axes_a = {v for t in a.tensors.values() for v in t.shape}
+    for name, ta in a.tensors.items():
+        tb = b.tensors.get(name)
+        if layer_parts(name) is None and tb and is_wider(ta.shape, tb.shape):
+            for x, y in zip(ta.shape, tb.shape):
+                if x != y:
+                    candidates[x].add(y)
+    return {x: next(iter(ys)) for x, ys in candidates.items()
+            if len(ys) == 1 and next(iter(ys)) not in axes_a}
+
+
+def stack_fingerprints(a, b, stack):
+    la = _stacks(a).get(stack.a_prefix, [])
+    lb = _stacks(b).get(stack.b_prefix, [])
+    if stack.pairing_basis == 'width':
+        inverse = {y: x for x, y in axis_map(a, b).items()}
+        la, lb = _width_fingerprints(la, {}), _width_fingerprints(lb, inverse)
+    elif stack.pairing_basis == 'name':
+        la, lb = [[(n, tuple(x[0] for x in fp)) for n, fp in ls] for ls in (la, lb)]
+    return dict(la), dict(lb)
+
+
+def insertion_runs(stack, fps_a, fps_b):
+    # Recover provisional insertions even when their reported positions are hidden.
+    runs = []
+    for kind, small, large in [('added', fps_a, fps_b), ('removed', fps_b, fps_a)]:
+        ns, nl = sorted(small), sorted(large)
+        fs, fl = [small[n] for n in ns], [large[n] for n in nl]
+        opcodes = SequenceMatcher(None, fs, fl, autojunk=False).get_opcodes()
+        inserted = [t for tag, i, j, k, l in opcodes if tag in ('insert', 'replace')
+                    for t in range(k + (min(j-i, l-k) if tag == 'replace' else 0), l)]
+        seen = set()
+        for p in inserted:
+            s = e = p
+            while s > 0 and fl[s-1] == fl[p]: s -= 1
+            while e+1 < len(fl) and fl[e+1] == fl[p]: e += 1
+            if s == e or (s, e) in seen: continue
+            seen.add((s, e))
+            if sum(s <= t <= e for t in inserted) != 1: continue
+            # Map the large interval into the small sequence using the opcode anchor.
+            anchor = next((i-k for tag, i, j, k, l in opcodes if k <= s < l), None)
+            if anchor is None: continue
+            start = s + anchor
+            small_numbers = ns[start:start + e-s]
+            large_numbers = nl[s:e+1]
+            if start < 0 or len(small_numbers) != e-s: continue
+            if any(small[n] != fl[p] for n in small_numbers): continue
+            choices = []
+            for offset, q in enumerate(large_numbers):
+                retained = large_numbers[:offset] + large_numbers[offset+1:]
+                pairs = tuple(zip(small_numbers, retained))
+                if kind == 'removed': pairs = tuple((y, x) for x, y in pairs)
+                choices.append((q, pairs))
+            aa, bb = (small_numbers, large_numbers) if kind == 'added' else (large_numbers, small_numbers)
+            runs.append(Run(kind, tuple(large_numbers), tuple(choices), tuple(aa), tuple(bb)))
+    return runs
+
+
+def choose_insertion(run, M):
+    scored = [(sum(bool(M.get((i, j), False)) for i, j in pairs), -q, q, len(pairs))
+              for q, pairs in run.candidates]
+    score, _, q, total = max(scored)
+    return q, score == total
+
+
+def resolve_run(stack, run, q, all_matched):
+    if not all_matched: return stack
+    inside = set(run.a_layers), set(run.b_layers)
+    equal = [(i,j) for i,j in stack.equal_pairs if i not in inside[0] and j not in inside[1]]
+    equal.extend(dict(run.candidates)[q])
+    added, removed = list(stack.added), list(stack.removed)
+    if run.kind == 'added':
+        added = [n for n in added if n not in run.positions] + [q]
+    else:
+        removed = [n for n in removed if n not in run.positions] + [q]
+    changed = tuple((i,j) for i,j in stack.changed if i not in inside[0] and j not in inside[1])
+    known = len(added) == stack.added_count and len(removed) == stack.removed_count
+    return replace(stack, added=tuple(sorted(added)), removed=tuple(sorted(removed)),
+                   equal_pairs=tuple(sorted(equal)), changed=changed, position_known=known,
+                   position_basis='samples' if known else 'structure')

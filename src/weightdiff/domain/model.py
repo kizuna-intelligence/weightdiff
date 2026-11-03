@@ -35,11 +35,12 @@ class ConfigChange:
 
 
 Fingerprint = tuple[tuple[str, str, tuple[int, ...]], ...]
+WidthFingerprint = tuple[tuple[str, tuple[int, ...]], ...]
 
 
 @dataclass(frozen=True)
 class FingerprintCount:
-    fingerprint: Fingerprint | tuple[str, ...]
+    fingerprint: Fingerprint | WidthFingerprint | tuple[str, ...]
     a_count: int
     b_count: int
 
@@ -59,7 +60,8 @@ class LayerStackSummary:
     a_prefix: str | None = None
     b_prefix: str | None = None
     equal_pairs: tuple[tuple[int, int], ...] = ()
-    pairing_basis: Literal['shape', 'name'] = 'shape'
+    pairing_basis: Literal['shape', 'name', 'width'] = 'shape'
+    position_basis: Literal['structure', 'samples'] = 'structure'
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,7 @@ class SamplePlan:
 @dataclass(frozen=True)
 class SampleResult:
     name: str
-    status: Literal['same', 'different', 'skipped', 'embedded_top_left', 'not_top_left', 'same_after_requant', 'within_quant_noise', 'beyond_quant_noise', 'systematic', 'pending_quant', 'same_after_transform', 'rearranged']
+    status: Literal['same', 'different', 'skipped', 'embedded_top_left', 'not_top_left', 'same_after_requant', 'within_quant_noise', 'beyond_quant_noise', 'systematic', 'pending_quant', 'same_after_transform', 'rearranged', 'rescaled']
     reason: str
     stack_prefix: str | None = None
     layer_pair: tuple[int, int] | None = None
@@ -118,6 +120,9 @@ class SampleResult:
     transform: str | None = None
     transform_errors: tuple[tuple[str, float], ...] = ()
     calibration_note: str | None = None
+    max_abs_a: float | None = None
+    max_abs_b: float | None = None
+    scale: float | None = None
 
 
 @dataclass(frozen=True)
@@ -159,3 +164,32 @@ class Report:
     sampling_enabled: bool = True
     sample_candidates: int = 0
     quant_noise: tuple[QuantNoise, ...] = ()
+    new_regions: tuple['RegionStats', ...] = ()
+
+
+@dataclass(frozen=True)
+class RegionStats:
+    name: str
+    region: Literal['extra_columns', 'extra_rows', 'extra_elements', 'new_tensor']
+    count: int
+    zero_fraction: float
+    max_abs: float
+    finite: bool
+
+
+@dataclass(frozen=True)
+class RegionPlan:
+    name: str
+    region: Literal['extra_columns', 'extra_rows', 'extra_elements', 'new_tensor']
+    file: str
+    ranges: tuple[tuple[int, int], ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class Run:
+    kind: Literal['added', 'removed']
+    positions: tuple[int, ...]
+    candidates: tuple[tuple[int, tuple[tuple[int, int], ...]], ...]
+    a_layers: tuple[int, ...]
+    b_layers: tuple[int, ...]

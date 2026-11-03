@@ -5,14 +5,15 @@ from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 
-from ..domain.compare import compare_samples, diff_config, diff_files, diff_tensors, plan_samples, sample_pairs
+from ..domain.compare import compare_samples, diff_config, diff_files, diff_tensors, plan_samples, sample_pairs, plan_regions, region_stats, FLOAT_SIZES
 from ..domain.flags import make_flags
-from ..domain.layers import summarize_layers
+from ..domain.layers import (summarize_layers, axis_map, insertion_runs, stack_fingerprints,
+                             choose_insertion, resolve_run, layer_parts)
 from ..domain.quant import (compare_quant_sample, classify_quant_samples, native_calibration_inputs,
                             plan_rearrangement, compare_rearrangement, column_group_sizes)
-from ..domain.model import ModelSnapshot, Report, TensorInfo
+from ..domain.model import ModelSnapshot, Report, TensorInfo, SamplePlan
 from ..external import hub, local, gguf, gguf_names, ggml
-from ..external._io import start_counting, stop_counting
+from ..external._io import start_counting, stop_counting, sample_category
 
 
 def _location(ref):
@@ -153,6 +154,55 @@ def snapshot(ref, revision=None) -> ModelSnapshot:
     return ModelSnapshot(ref, revision, files, config, tokenizer, tensors, tuple(notes))
 
 
+def _resolve_positions(a, b, stacks, locations, notes):
+    if a.format != 'safetensors' or b.format != 'safetensors': return stacks
+    result = []
+    for stack in stacks:
+        if stack.position_known:
+            result.append(stack)
+            continue
+        for run in insertion_runs(stack, *stack_fingerprints(a, b, stack)):
+            # One matrix suffix must be present in every layer of the run.
+            options = []
+            for name, t in a.tensors.items():
+                parts = layer_parts(name)
+                if not parts or parts[0] != stack.a_prefix or parts[1] != run.a_layers[0]: continue
+                if len(t.shape) != 2 or t.dtype not in FLOAT_SIZES: continue
+                tensors = [a.tensors.get(f'{stack.a_prefix}{i}{parts[2]}') for i in run.a_layers]
+                tensors += [b.tensors.get(f'{stack.b_prefix}{j}{parts[2]}') for j in run.b_layers]
+                if all(t and len(t.shape)==2 and t.dtype in FLOAT_SIZES for t in tensors):
+                    options.append((t.shape[0]*t.shape[1], parts[2]))
+            if not options: continue
+            _, suffix = max(options)
+            acols = a.tensors[f'{stack.a_prefix}{run.a_layers[0]}{suffix}'].shape[1]
+            count = min(2048, acols)
+            if not count: continue
+            def read(item):
+                side, i = item
+                snap, loc, prefix = (a, locations[0], stack.a_prefix) if side == 'a' else (b, locations[1], stack.b_prefix)
+                t = snap.tensors[f'{prefix}{i}{suffix}']
+                if t.shape[1] < count: raise ValueError('Insertion probe row is too narrow')
+                source, repo, _ = loc
+                with sample_category('position_bytes'):
+                    data = source.read_ranges(repo,snap.revision,t.file,((t.data_start,count*FLOAT_SIZES[t.dtype]),))
+                return (side,i), (t, data)
+            try:
+                probes = dict(_parallel(read,[('a',i) for i in run.a_layers]+[('b',j) for j in run.b_layers]))
+                matrix = {}
+                for i in run.a_layers:
+                    ta, da = probes['a',i]
+                    for j in run.b_layers:
+                        tb, db = probes['b',j]
+                        plan = SamplePlan('position probe',ta.file,((0,len(da[0])),),tb.file,((0,len(db[0])),),ta.dtype,tb.dtype)
+                        matrix[i,j] = compare_samples(plan,da,db).status == 'same'
+                q, matched = choose_insertion(run,matrix)
+                stack = resolve_run(stack,run,q,matched)
+            except Exception as exc:
+                notes.append(f'Insertion position sampling unavailable: {type(exc).__name__}: {exc}')
+        result.append(stack)
+    return result
+
+
 def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=160, progress=None) -> Report:
     if max_tensors < 0:
         raise ValueError('max_tensors must be nonnegative')
@@ -168,6 +218,11 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
         b = snapshot(b_ref, b_rev)
         a, b = _align_gguf_names(a, b)
         layers = summarize_layers(a, b)
+        locations = _location(a.ref), _location(b.ref)
+        collection_notes = []
+        if sample and max_tensors:
+            layers = _resolve_positions(a,b,layers,locations,collection_notes)
+        widths = axis_map(a,b)
         tensors = diff_tensors(a, b, layers)
         candidates = sample_pairs(a, b, tensors, layers)
         plans = plan_samples(a, b, candidates, max_tensors, layers) if sample else []
@@ -188,7 +243,7 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
                 native = {dtype: ggml.roundtrip(values, dtype)
                           for dtype, values in native_calibration_inputs(plan, *data).items()}
                 return compare_quant_sample(plan, *data, roundtrips=native)
-            return compare(plan, *data)
+            return compare(plan, *data, width_map=widths)
         update(.3, f'Sampling {len(plans)} tensors')
         samples = []
         with ThreadPoolExecutor(max_workers=16) as executor:
@@ -231,10 +286,24 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
         update(.96, 'Checking transformations and row/column rearrangements')
         samples = _parallel(check_rearrangement, zip(plans, samples))
         samples, noise = classify_quant_samples(samples)
+        regions = []
+        region_plans = plan_regions(a,b,tensors,layers) if sample and max_tensors else []
+        def read_region(plan):
+            source, repo, _ = locations[1]
+            try:
+                with sample_category('region_bytes'):
+                    data = source.read_ranges(repo,b.revision,plan.file,plan.ranges)
+                return region_stats(plan,data), None
+            except Exception as exc:
+                return None, f'{plan.name} ({plan.region}): region unavailable ({type(exc).__name__}: {exc})'
+        for region, note in _parallel(read_region,region_plans):
+            if region is not None: regions.append(region)
+            if note: collection_notes.append(note)
+        if collection_notes: b = replace(b,notes=b.notes+tuple(collection_notes))
         stats = dict(counter.values)
-        stats['total_bytes'] = sum(stats[k] for k in ('header_bytes', 'sample_bytes', 'small_file_bytes'))
+        stats['total_bytes'] = sum(stats[k] for k in ('header_bytes', 'sample_bytes', 'small_file_bytes', 'region_bytes', 'position_bytes'))
         report = Report(a, b, diff_config(a.config, b.config), layers, tensors, tuple(samples),
-                        diff_files(a.files, b.files), [], perf_counter() - started, stats, sample, len(candidates), noise)
+                        diff_files(a.files, b.files), [], perf_counter() - started, stats, sample, len(candidates), noise, tuple(regions))
         report = replace(report, flags=make_flags(report))
         update(1, 'Comparison complete')
         return report
