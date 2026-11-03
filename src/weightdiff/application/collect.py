@@ -7,12 +7,13 @@ from time import perf_counter
 
 from ..domain.compare import compare_samples, diff_config, diff_files, diff_tensors, plan_samples, sample_pairs, plan_regions, region_stats, FLOAT_SIZES
 from ..domain.flags import make_flags
+from ..domain import safetensors_quant as stq
 from ..domain.layers import (summarize_layers, axis_map, insertion_runs, stack_fingerprints,
                              choose_insertion, resolve_run, layer_parts)
 from ..domain.quant import (compare_quant_sample, classify_quant_samples, native_calibration_inputs,
                             plan_rearrangement, compare_rearrangement, column_group_sizes)
 from ..domain.model import ModelSnapshot, Report, TensorInfo, SamplePlan
-from ..external import hub, local, gguf, gguf_names, ggml
+from ..external import hub, local, gguf, gguf_names, ggml, safetensors_quant
 from ..external._io import start_counting, stop_counting, sample_category
 
 
@@ -100,12 +101,14 @@ def snapshot(ref, revision=None) -> ModelSnapshot:
     revision = source.resolve_revision(ref, revision)
     files = tuple(sorted(source.list_files(ref, revision)))
     small_names = [f for f in ('config.json', 'tokenizer_config.json', 'model.safetensors.index.json',
-                              'chat_template.json', 'chat_template.jinja') if f in files]
+                              'chat_template.json', 'chat_template.jinja', 'quantize_config.json') if f in files]
     def read_small(name):
         reader = source.read_text if name.endswith('.jinja') else source.read_json
         return name, reader(ref, revision, name)
     small = dict(_parallel(read_small, small_names))
     config = small.get('config.json')
+    if small.get('quantize_config.json') and not (config or {}).get('quantization_config'):
+        config = {**(config or {}), 'quantization_config': {'quant_method':'gptq', **small['quantize_config.json']}}
     tokenizer = small.get('tokenizer_config.json')
     templates = {name: small[name] for name in ('chat_template.jinja', 'chat_template.json') if name in small}
     if templates:
@@ -151,7 +154,48 @@ def snapshot(ref, revision=None) -> ModelSnapshot:
         wrong = [n for n, t in tensors.items() if index['weight_map'].get(n) != t.file]
         if missing or wrong:
             notes.append(f'Index/header mismatch: {len(missing)} missing tensors, {len(wrong)} unlisted or wrong-shard tensors.')
-    return ModelSnapshot(ref, revision, files, config, tokenizer, tensors, tuple(notes))
+    raw = {name: {'dtype': t.dtype, 'shape': list(t.shape), 'nbytes': t.nbytes,
+                  'file': t.file, 'data_start': t.data_start} for name,t in tensors.items()}
+    with sample_category('header_bytes'):
+        logical, quant_notes = safetensors_quant.logical_tensors(raw, config,
+            lambda filename, ranges: source.read_ranges(ref, revision, filename, ranges))
+    tensors = {name: TensorInfo(name, item['dtype'], tuple(item['shape']), item['nbytes'],
+                               item['file'], item['data_start'], item.get('quantization'))
+               for name,item in logical.items()}
+    return ModelSnapshot(ref, revision, files, config, tokenizer, tensors, tuple(notes+quant_notes))
+
+
+def _read_st_values(t, windows, snap, location):
+    source, repo, _ = location
+    request = stq.index_request(t)
+    g_idx = None
+    if request:
+        filename, start, count = request
+        g_idx = stq.floats(source.read_ranges(repo,snap.revision,filename,((start,count),))[0], 'I32').astype('int64')
+    requests, recipes = stq.read_plan(t,windows,g_idx)
+    # Group by file, preserving recipe order, for sharded auxiliary tensors.
+    chunks = [None]*len(requests)
+    by_file = {}
+    for i,(filename,start,length) in enumerate(requests):
+        by_file.setdefault(filename,[]).append((i,(start,length)))
+    for filename,items in by_file.items():
+        data=source.read_ranges(repo,snap.revision,filename,tuple(r for _,r in items))
+        if len(data)!=len(items):raise ValueError('Incomplete quantization component ranges')
+        for (i,(_,length)),chunk in zip(items,data):
+            if len(chunk)!=length:raise ValueError('Truncated quantization component range')
+            chunks[i]=chunk
+    return stq.decode(t,recipes,chunks), recipes, chunks
+
+
+def _compare_st(plan,a,b,locations):
+    try:
+        if plan.skip_reason:raise ValueError(plan.skip_reason)
+        va,ra,da=_read_st_values(plan.a_tensor,plan.a_windows,a,locations[0])
+        vb,rb,db=_read_st_values(plan.b_tensor,plan.b_windows,b,locations[1])
+        return stq.compare_restored(plan,va,vb,rb,db)
+    except Exception as exc:
+        return stq.SampleResult(plan.name,'skipped',f'Cannot compare quantization / 比べられない: {type(exc).__name__}: {exc}',
+                                plan.stack_prefix,plan.layer_pair)
 
 
 def _resolve_positions(a, b, stacks, locations, notes):
@@ -182,17 +226,22 @@ def _resolve_positions(a, b, stacks, locations, notes):
                 snap, loc, prefix = (a, locations[0], stack.a_prefix) if side == 'a' else (b, locations[1], stack.b_prefix)
                 t = snap.tensors[f'{prefix}{i}{suffix}']
                 if t.shape[1] < count: raise ValueError('Insertion probe row is too narrow')
-                source, repo, _ = loc
                 with sample_category('position_bytes'):
-                    data = source.read_ranges(repo,snap.revision,t.file,((t.data_start,count*FLOAT_SIZES[t.dtype]),))
-                return (side,i), (t, data)
+                    data,recipes,chunks=_read_st_values(t,((0,count),),snap,loc)
+                return (side,i), (t,data,recipes,chunks)
             try:
                 probes = dict(_parallel(read,[('a',i) for i in run.a_layers]+[('b',j) for j in run.b_layers]))
                 matrix = {}
                 for i in run.a_layers:
-                    ta, da = probes['a',i]
+                    ta, va, ra, da = probes['a',i]
                     for j in run.b_layers:
-                        tb, db = probes['b',j]
+                        tb, vb, rb, db = probes['b',j]
+                        if ta.quantization or tb.quantization:
+                            # RTN matching uses a complete block/row reference.
+                            probe=stq.pair_plan(ta,tb,'position probe',aw=((0,count),),bw=((0,count),))
+                            matched=stq.compare_restored(probe,va,vb,rb,db)
+                            matrix[i,j]=matched.status in ('same_after_requant','within_quant_noise')
+                            continue
                         plan = SamplePlan('position probe',ta.file,((0,len(da[0])),),tb.file,((0,len(db[0])),),ta.dtype,tb.dtype)
                         matrix[i,j] = compare_samples(plan,da,db).status == 'same'
                 q, matched = choose_insertion(run,matrix)
@@ -228,6 +277,7 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
         plans = plan_samples(a, b, candidates, max_tensors, layers) if sample else []
         locations = _location(a.ref), _location(b.ref)
         def read_pair(plan):
+            if plan.mode=='st_quant':return _compare_st(plan,a,b,locations)
             compare = compare_quant_sample if plan.mode == 'quant' else compare_samples
             if plan.skip_reason:
                 return compare(plan, None, None)
@@ -291,6 +341,11 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
         def read_region(plan):
             source, repo, _ = locations[1]
             try:
+                if plan.tensor is not None:
+                    with sample_category('region_bytes'):
+                        values,_,_=_read_st_values(plan.tensor,plan.windows,b,locations[1])
+                    raw=values.astype('<f4').tobytes()
+                    return region_stats(replace(plan,dtype='F32',ranges=((0,len(raw)),)),[raw]),None
                 with sample_category('region_bytes'):
                     data = source.read_ranges(repo,b.revision,plan.file,plan.ranges)
                 return region_stats(plan,data), None

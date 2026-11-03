@@ -85,10 +85,19 @@ def stack_sample_counts(report):
             for s in report.layer_summary]
 
 
+def has_quantization(report):
+    return (report.a.format == 'gguf' or report.b.format == 'gguf'
+            or any(t.quantization for snap in (report.a,report.b) for t in snap.tensors.values()))
+
+
 def quantization_markdown(report):
     lines = []
     for noise in report.quant_noise:
         source = 'expected error from A roundtrip' if noise.source == 'A' else 'observed error in B (fallback)'
+        if noise.source == 'A' and noise.median == 0 and noise.dtype.startswith(('bnb_', 'gptq', 'awq')):
+            lines.append(f'- **{noise.dtype}**: zero measured RTN error on sampled values; {noise.count} tensors. '
+                         'The quantized format is retained. / 抜き取りでの RTN 誤差は 0（量子化形式）')
+            continue
         if noise.source == 'A' and noise.median == 0:
             lines.append(f'- **{noise.dtype}**: no quantization; {noise.count} tensors compared exactly '
                          '(float32 rounding only). / 量子化なし。丸めの範囲で厳密に比較')
@@ -132,7 +141,7 @@ def overview_sentences(report):
                          f'(A {stack.a_count}, B {stack.b_count}; removed positions {_positions(stack.removed) if stack.position_known else "unknown"}, {stack.position_basis}).')
         else:
             parts.append(f'A and B each have {stack.a_count} layers in {name}.')
-        if paired and (report.a.format == 'gguf' or report.b.format == 'gguf'):
+        if paired and (has_quantization(report)):
             parts.append(f'{paired} layers pair with A\'s layers; quantized samples: '
                          f'{counts["same_after_requant"]} same after requant, '
                          f'{counts["within_quant_noise"]} within noise, {counts["beyond_quant_noise"]} beyond, '
@@ -158,7 +167,7 @@ def overview_sentences(report):
                  + (f', {samples["embedded_top_left"]} embedded_top_left, {samples["not_top_left"]} not_top_left.'
                     if top_left_total else '.')
                  if report.sampling_enabled else 'Sampling disabled; no values were compared.')
-    if report.a.format == 'gguf' or report.b.format == 'gguf':
+    if has_quantization(report):
         beyond, uniform = samples['beyond_quant_noise'], samples['systematic']
         if report.sampling_enabled:
             parts.append(f'{beyond + uniform} tensors differ beyond quantization noise '
@@ -212,7 +221,7 @@ def metric_cards(report):
     else:
         sample_title = 'Sampled values'
         sample_value = str(differences)
-    if report.a.format == 'gguf' or report.b.format == 'gguf':
+    if has_quantization(report):
         sample_title = 'Quantized values'
         sample_value = str(counts['beyond_quant_noise'] + counts['systematic'])
         sample_detail = quantization_counts(report, card=True)
@@ -258,7 +267,7 @@ def summary_markdown(report):
               f'{counts["same"]} same / {counts["different"] + counts["rescaled"]} different / rescaled {counts["rescaled"]} / {counts["skipped"]} skipped / '
               f'{counts["embedded_top_left"]} embedded_top_left / {counts["not_top_left"]} not_top_left'
               for s, paired, counts in stack_sample_counts(report)]
-    if report.a.format == 'gguf' or report.b.format == 'gguf':
+    if has_quantization(report):
         lines.append('- **Quantized samples:** ' + quantization_counts(report))
         lines.append(f'- **No name correspondence:** A {len(report.a.unmapped_names)} · B {len(report.b.unmapped_names)}')
         lines.append(quantization_markdown(report))
@@ -315,7 +324,17 @@ def samples_markdown(report):
     description = f'{count} of {total} candidate tensors sampled.'
     if count < total:
         description += ' Names were evenly subsampled.'
-    if report.a.format == 'gguf' or report.b.format == 'gguf':
+    if any(t.quantization for snap in (report.a,report.b) for t in snap.tensors.values()):
+        description += ('\n\nQuantized safetensors use logical shapes and bounded packed blocks, scales and zeros. '
+            'bitsandbytes compares reconstructed values with A quantized using the same code map and block size '
+            '(same_after_requant / 量子化だけの違い). GPTQ/AWQ use 1.5 × the error of A rounded to the same '
+            'bits and groups as their noise floor; g_idx selects act_order groups. '
+            'Wider tensors compare the top-left rows. Unavailable codecs or incomplete reference blocks '
+            'are skipped with a reason. Unread values have not been compared.\n\n')
+        description += quantization_markdown(report) + '\n\n'
+        return description + _table(['Tensor','Result','Relative error','Threshold','Detail'],
+            [(s.name,s.status,s.relative_error,s.threshold,s.reason) for s in report.samples])
+    if has_quantization(report):
         description += ('\n\nSamples align to quantization blocks (first and middle 2,048 elements). '
             'Same-typed GGUF pairs compare exact block bytes. Other pairs are dequantized to float32. '
             'same_after_requant: the original quantized to B’s dtype matches exactly. '

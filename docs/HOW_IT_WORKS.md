@@ -218,3 +218,44 @@ median to be exceeded. Reports show the expected error median and the approximat
 undetectable change size (twice that median). Same-typed GGUF pairs use exact sampled
 bytes; different types use the larger floor. Reverse float/GGUF comparisons calibrate
 against the floating-point side. Unsupported decoders or shapes are skipped explicitly.
+
+### Quantized safetensors
+
+bitsandbytes NF4/FP4 checkpoints are represented as one logical tensor per weight:
+the packed storage and its absmax, code map and JSON state are folded together.
+Fingerprints and parameter counts use the original shape and dtype; stored byte
+counts include auxiliary tensors. Row-major bitsandbytes INT8 uses SCB row scales.
+GPTQ and AWQ GEMM use logical `[output, input]` shapes. GPTQ's input-axis packing,
+legacy zero-minus-one encoding and `g_idx` group assignment are distinct from AWQ's
+output-axis packing and interleaved nibble order. Auxiliary tensors may span shards.
+`quantize_config.json` is accepted when config has no quantization_config.
+
+Domain functions plan component ranges and restore values from supplied bytes;
+they perform no I/O. The application executes those plans using local or Hub
+adapters. Equal-shape samples use up to 2,048 elements at first/middle rows;
+row-scaled INT8 and act_order calibration require complete sampled rows. Wider
+weights use first/middle/last A-width rows. No entire weight is loaded for comparison.
+NF4/FP4 read only intersecting blocks and absmax entries, with the high nibble first.
+
+For bitsandbytes, A is rounded using the same code map and block size, then
+restored in the logical floating dtype. Exact restored-value equality is
+`same_after_requant` (量子化だけの違い), including zero blocks with different
+packed codes. GPTQ/AWQ use an A-only RTN reference with the same bits and group
+assignments: normalized L2 error at most 1.5 times the reference error (minimum
+1e-5 for floating rounding) is `within_quant_noise`. Other results are
+`beyond_quant_noise`; repeated differences can be `systematic`, which also counts
+as a difference. No B-derived noise calibration is used for these codecs.
+
+The same restoration feeds insertion probes and new-region statistics, including
+quantized new layers and widened regions. Unsupported layouts (including AWQ GEMV,
+Marlin and compressed-tensors), missing components, invalid g_idx,
+failed reads, quantized A calibration, and partial reference blocks are explicitly
+skipped. Nested absmax statistics can be restored for region inspection; exact
+re-quantization requiring unavailable second-level reference statistics is skipped
+with its reason. These limits do not imply any result about unread values.
+
+`D2/generate_quant_fixtures.py` creates complete CPU NumPy RTN checkpoints in the
+bitsandbytes NF4 or row-major INT8 serialization format. It deliberately reads the
+full source to **create test data**; those reads and timings are separate from the
+bounded comparison reports. It does not load model classes, execute repository
+code, use a GPU, or require torch/bitsandbytes at runtime.

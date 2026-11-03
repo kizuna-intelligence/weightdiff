@@ -5,6 +5,7 @@ from math import prod
 import numpy as np
 
 from .quant import plan_quant_sample
+from . import safetensors_quant as stq
 from .layers import layer_parts
 from .shapes import is_wider
 from .model import AxisChange, ConfigChange, FileDiff, SamplePlan, SampleResult, TensorDiff, RegionPlan, RegionStats
@@ -153,6 +154,10 @@ def plan_samples(a, b, same_meta, max_tensors=160, layer_summary=()) -> list[Sam
         pa, pb = layer_parts(na), layer_parts(nb)
         stack = next((s for s in layer_summary if pa and pb and s.a_prefix == pa[0]
                       and s.b_prefix == pb[0]), None)
+        if ta.quantization or tb.quantization:
+            plans.append(stq.pair_plan(ta,tb,na if na==nb else f'{na} → {nb}',
+                stack.prefix if stack else None,(pa[1],pb[1]) if stack else None))
+            continue
         if a.format == 'gguf' or b.format == 'gguf':
             plans.append(plan_quant_sample(ta, tb, na if na == nb else f'{na} → {nb}',
                 a.format, b.format, stack.prefix if stack else None,
@@ -236,7 +241,8 @@ def compare_samples(plan, bytes_a, bytes_b, width_map=None) -> SampleResult:
             valid = np.abs(aa) > 1e-3
             if not np.any(valid): continue
             c = float(np.median(bb[valid] / aa[valid]))
-            if not np.isfinite(c): continue
+            # A scale within the tolerance itself cannot be told apart from small edits.
+            if not np.isfinite(c) or abs(c - 1) <= 2**-7: continue
             if np.all(np.abs(bb - c * aa) <= 2**-7 * np.abs(bb) + 2**-14):
                 reason = f'(1+w) の形で ×{c:.6g}' if shifted else f'×{c:.6g} で一様に縮めた'
                 for x, y in (width_map or {}).items():
@@ -269,6 +275,9 @@ def plan_regions(a, b, tensor_diff, layer_summary, max_regions=160):
     plans = []
     def add(t, region, windows):
         if t.dtype not in FLOAT_SIZES: return
+        if t.quantization:
+            plans.append(RegionPlan(t.name,region,t.file,(),t.dtype,t,tuple(windows)))
+            return
         size = FLOAT_SIZES[t.dtype]
         ranges = tuple((t.data_start + start*size, count*size) for start,count in windows if count)
         if ranges: plans.append(RegionPlan(t.name, region, t.file, ranges, t.dtype))
@@ -300,7 +309,10 @@ def plan_regions(a, b, tensor_diff, layer_summary, max_regions=160):
     for name in sorted(new):
         t = b.tensors[name]
         if t.dtype in FLOAT_SIZES:
-            plans.append(RegionPlan(name,'new_tensor',t.file,_element_ranges(t),t.dtype))
+            if t.quantization:
+                plans.append(RegionPlan(name,'new_tensor',t.file,(),t.dtype,t,stq.windows(t)))
+            else:
+                plans.append(RegionPlan(name,'new_tensor',t.file,_element_ranges(t),t.dtype))
     plans.sort(key=lambda p:(p.name,p.region))
     priority = [p for p in plans if p.region == 'new_tensor' or layer_parts(p.name) is None]
     remaining = [p for p in plans if p.region != 'new_tensor' and layer_parts(p.name) is not None]

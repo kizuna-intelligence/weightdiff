@@ -54,3 +54,7 @@ See the table above for example results and [docs/HOW_IT_WORKS.md](docs/HOW_IT_W
 ## License
 
 Apache-2.0
+
+Quantized safetensors: bitsandbytes NF4/FP4/row-major INT8, GPTQ and AWQ GEMM
+are compared using logical tensor shapes and bounded restored-value samples.
+See [codec rules and supported layouts](docs/HOW_IT_WORKS.md#quantized-safetensors).

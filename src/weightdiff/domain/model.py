@@ -10,6 +10,7 @@ class TensorInfo:
     nbytes: int
     file: str
     data_start: int
+    quantization: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -100,10 +101,14 @@ class SamplePlan:
     stack_prefix: str | None = None
     layer_pair: tuple[int, int] | None = None
     skip_reason: str | None = None
-    mode: Literal['values', 'top_left', 'quant'] = 'values'
+    mode: Literal['values', 'top_left', 'quant', 'st_quant'] = 'values'
     a_format: str = 'safetensors'
     b_format: str = 'safetensors'
     tensor_shape: tuple[int, ...] = ()
+    a_tensor: TensorInfo | None = None
+    b_tensor: TensorInfo | None = None
+    a_windows: tuple[tuple[int, int], ...] = ()
+    b_windows: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -184,6 +189,8 @@ class RegionPlan:
     file: str
     ranges: tuple[tuple[int, int], ...]
     dtype: str
+    tensor: TensorInfo | None = None
+    windows: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)

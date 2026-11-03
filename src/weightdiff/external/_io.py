@@ -7,7 +7,7 @@ from pathlib import Path
 
 MAX_HEADER = 100 * 1024 * 1024
 MAX_SMALL_FILE = 16 * 1024 * 1024
-SMALL_JSON = {'config.json', 'tokenizer_config.json', 'model.safetensors.index.json', 'chat_template.json'}
+SMALL_JSON = {'quantize_config.json', 'config.json', 'tokenizer_config.json', 'model.safetensors.index.json', 'chat_template.json'}
 _sample_category = ContextVar('weightdiff_sample_category', default='sample_bytes')
 _stats = ContextVar('weightdiff_read_stats', default=None)
 

@@ -361,6 +361,8 @@ def classify_quant_samples(samples, expected_layers=None, *, systematic=True):
         observed_layers = {layer_parts(s.name.split(' → ', 1)[0])[1] for s in group}
         if len(observed_layers) < 3 or not all(s.status == 'beyond_quant_noise' for s in group):
             continue
+        if any(s.relative_error is None for s in group):
+            continue
         values = np.array([s.relative_error for s in group])
         median = float(np.median(values))
         if median > 0 and float(np.median(np.abs(values - median))) / median < .2:

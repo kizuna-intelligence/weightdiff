@@ -7,7 +7,7 @@ os.environ.setdefault('GRADIO_ANALYTICS_ENABLED', 'False')
 import gradio as gr
 
 from .collect import build_report
-from .report import (DISCLAIMER, position_notes, flags_markdown, layer_rows, metric_cards,
+from .report import (has_quantization, DISCLAIMER, position_notes, flags_markdown, layer_rows, metric_cards,
                      overview_markdown, regions_markdown, read_footer, samples_markdown, tensor_rows, to_json, quantization_markdown)
 
 DASHBOARD_CSS = '''
@@ -154,7 +154,7 @@ def compare(a, b, rev_a, rev_b, sample, progress=gr.Progress()):
     tensor_note = (f'{d.excluded_by_layer_shift} tensor names excluded from name comparison because layer counts differ. '
                    f'Parameters: A {d.a_parameters:,} · B {d.b_parameters:,}. '
                    'Showing the first 50 differences; download JSON for all.')
-    return (metric_cards(report), overview_markdown(report) + ('\n\n' + quantization_markdown(report) if report.a.format == 'gguf' or report.b.format == 'gguf' else ''), flags_markdown(report),
+    return (metric_cards(report), overview_markdown(report) + ('\n\n' + quantization_markdown(report) if has_quantization(report) else ''), flags_markdown(report),
             layer_rows(report, changed_limit=8), position_notes(report), tensor_rows(report)[:50], tensor_note,
             [[c.key, str(c.a_value), str(c.b_value), c.kind] for c in report.config_diff],
             files, samples_markdown(report), regions_markdown(report), download, read_footer(report))
