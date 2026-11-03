@@ -21,6 +21,9 @@ class ModelSnapshot:
     tokenizer_config: dict | None
     tensors: dict[str, TensorInfo]
     notes: tuple[str, ...]
+    format: Literal['safetensors', 'gguf'] = 'safetensors'
+    original_names: dict[str, str] = field(default_factory=dict)
+    unmapped_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,16 +98,37 @@ class SamplePlan:
     stack_prefix: str | None = None
     layer_pair: tuple[int, int] | None = None
     skip_reason: str | None = None
-    mode: Literal['values', 'top_left'] = 'values'
+    mode: Literal['values', 'top_left', 'quant'] = 'values'
+    a_format: str = 'safetensors'
+    b_format: str = 'safetensors'
+    tensor_shape: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
 class SampleResult:
     name: str
-    status: Literal['same', 'different', 'skipped', 'embedded_top_left', 'not_top_left']
+    status: Literal['same', 'different', 'skipped', 'embedded_top_left', 'not_top_left', 'same_after_requant', 'within_quant_noise', 'beyond_quant_noise', 'systematic', 'pending_quant', 'same_after_transform', 'rearranged']
     reason: str
     stack_prefix: str | None = None
     layer_pair: tuple[int, int] | None = None
+    relative_error: float | None = None
+    quant_types: tuple[str, ...] = ()
+    expected_errors: tuple[tuple[str, float], ...] = ()
+    threshold: float | None = None
+    transform: str | None = None
+    transform_errors: tuple[tuple[str, float], ...] = ()
+    calibration_note: str | None = None
+
+
+@dataclass(frozen=True)
+class QuantNoise:
+    dtype: str
+    median: float
+    mad: float
+    count: int
+    undetectable_percent: float
+    source: Literal['A', 'B'] = 'B'
+    detail: str = ''
 
 
 @dataclass(frozen=True)
@@ -134,3 +158,4 @@ class Report:
     read_stats: dict[str, int] = field(default_factory=dict)
     sampling_enabled: bool = True
     sample_candidates: int = 0
+    quant_noise: tuple[QuantNoise, ...] = ()

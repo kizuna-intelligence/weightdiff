@@ -37,6 +37,8 @@ def tensor_rows(report):
     paired = dict(d.name_pairs)
     rows = ([['Name location changed', f'{d.renamed_count} tensors', '', '', '', '']]
             if d.renamed_count else [])
+    if report.a.format != report.b.format:
+        rows += [['No correspondence', f'A: {len(report.a.unmapped_names)} · B: {len(report.b.unmapped_names)}', '', '', '', '']]
     for kind, names in [('Only A', d.only_a), ('Only B', d.only_b), ('Shape changed', d.shape_changed), ('Dtype changed', d.dtype_changed)]:
         for name in names:
             a = report.a.tensors.get(name) if kind != 'Only B' else None
@@ -55,7 +57,9 @@ def layer_rows(report, changed_limit=None):
         rows.append([layer.prefix, layer.a_count, layer.b_count, layer.added_count, layer.removed_count,
                      str(list(layer.added)) if layer.position_known else f'Unknown from {layer.pairing_basis}s',
                      str(list(layer.removed)), changed, fingerprints,
-                     'Paired by names (shapes differ) / 名前で組（形が違う）'
+                     ('Name correspondence (GGUF); dtype/shape ignored for alignment'
+                      if report.a.format == 'gguf' or report.b.format == 'gguf' else
+                      'Paired by names (shapes differ) / 名前で組（形が違う）')
                      if layer.pairing_basis == 'name' else 'Shape fingerprints'])
     return rows
 
@@ -80,6 +84,37 @@ def stack_sample_counts(report):
             for s in report.layer_summary]
 
 
+def quantization_markdown(report):
+    lines = []
+    for noise in report.quant_noise:
+        source = 'expected error from A roundtrip' if noise.source == 'A' else 'observed error in B (fallback)'
+        if noise.source == 'A' and noise.median == 0:
+            lines.append(f'- **{noise.dtype}**: no quantization; {noise.count} tensors compared exactly '
+                         '(float32 rounding only). / 量子化なし。丸めの範囲で厳密に比較')
+            continue
+        lines.append(f'- **{noise.dtype}**: {source}; median {noise.median:.8g} '
+                     f'({noise.median * 100:.4g}%), MAD {noise.mad:.8g}, {noise.count} tensors. '
+                     f'For this dtype, changes smaller than about {noise.undetectable_percent:.4g}% of the original values '
+                     'cannot be distinguished. / この型では、元の値の約 '
+                     f'{noise.undetectable_percent:.4g}% より小さい書き換えは見分けられません')
+        if noise.source == 'B':
+            lines.append(f'  **{noise.dtype}: Noise floor estimated from B itself; uniformly retrained values '
+                         'cannot be distinguished. / この型の雑音の床は B 自身から推定'
+                         '（全体を一様に変えた学習は見分けられません）** '
+                         + _cell(noise.detail))
+    return '\n'.join(lines) or 'No quantization noise estimate is available.'
+
+
+def quantization_counts(report, *, card=False):
+    counts = Counter(s.status for s in report.samples)
+    differences = f'beyond {counts["beyond_quant_noise"]} · uniform {counts["systematic"]}'
+    if card:
+        return differences
+    text = (f'within {counts["within_quant_noise"]} · requant-identical {counts["same_after_requant"]} '
+            f'· transform {counts["same_after_transform"]} · rearranged {counts["rearranged"]}')
+    return text + ' · ' + differences
+
+
 def overview_sentences(report):
     parts = []
     for stack, paired, counts in stack_sample_counts(report):
@@ -95,7 +130,14 @@ def overview_sentences(report):
                          f'(A {stack.a_count}, B {stack.b_count}).')
         else:
             parts.append(f'A and B each have {stack.a_count} layers in {name}.')
-        if paired:
+        if paired and (report.a.format == 'gguf' or report.b.format == 'gguf'):
+            parts.append(f'{paired} layers pair with A\'s layers; quantized samples: '
+                         f'{counts["same_after_requant"]} same after requant, '
+                         f'{counts["within_quant_noise"]} within noise, {counts["beyond_quant_noise"]} beyond, '
+                         f'{counts["same_after_transform"]} transform, {counts["rearranged"]} rearranged, '
+                         f'{counts["systematic"]} uniform, {counts["same"]} byte-identical, '
+                         f'{counts["different"]} byte-different, {counts["skipped"]} skipped.')
+        elif paired:
             parts.append(f'{paired} layers pair with A\'s layers; sampled values: '
                          f'{counts["same"]} same, {counts["different"]} different, {counts["skipped"]} skipped.')
             if counts['embedded_top_left'] or counts['not_top_left']:
@@ -114,6 +156,13 @@ def overview_sentences(report):
                  + (f', {samples["embedded_top_left"]} embedded_top_left, {samples["not_top_left"]} not_top_left.'
                     if top_left_total else '.')
                  if report.sampling_enabled else 'Sampling disabled; no values were compared.')
+    if report.a.format == 'gguf' or report.b.format == 'gguf':
+        beyond, uniform = samples['beyond_quant_noise'], samples['systematic']
+        if report.sampling_enabled:
+            parts.append(f'{beyond + uniform} tensors differ beyond quantization noise '
+                         f'({beyond} isolated, {uniform} uniform across sampled layers).')
+        parts.append('Quantized samples: ' + quantization_counts(report) + '.')
+        parts.append(f'Name correspondence unavailable: A {len(report.a.unmapped_names)}, B {len(report.b.unmapped_names)} tensors.')
     return parts
 
 
@@ -155,13 +204,18 @@ def metric_cards(report):
     else:
         sample_title = 'Sampled values'
         sample_value = str(counts['different'])
+    if report.a.format == 'gguf' or report.b.format == 'gguf':
+        sample_title = 'Quantized values'
+        sample_value = str(counts['beyond_quant_noise'] + counts['systematic'])
+        sample_detail = quantization_counts(report, card=True)
     if not report.sampling_enabled:
         sample_detail = 'Sampling disabled'
     notices = [f for f in report.flags if f.level == 'notice']
     cards = [
         ('Layers', layers, layer_detail, bool(delta)),
         ('Width', width_value, width_detail, width_changed),
-        (sample_title, sample_value, sample_detail, counts['different'] > 0),
+        (sample_title, sample_value, sample_detail,
+         counts['different'] > 0 or counts['beyond_quant_noise'] + counts['systematic'] > 0),
         ('Points to note', str(len(notices)), _flag_title(notices[0]) if notices else 'No notices', bool(notices)),
     ]
     html = ['<div class="wd-metrics" aria-label="Comparison summary">']
@@ -196,6 +250,10 @@ def summary_markdown(report):
               f'{counts["same"]} same / {counts["different"]} different / {counts["skipped"]} skipped / '
               f'{counts["embedded_top_left"]} embedded_top_left / {counts["not_top_left"]} not_top_left'
               for s, paired, counts in stack_sample_counts(report)]
+    if report.a.format == 'gguf' or report.b.format == 'gguf':
+        lines.append('- **Quantized samples:** ' + quantization_counts(report))
+        lines.append(f'- **No name correspondence:** A {len(report.a.unmapped_names)} · B {len(report.b.unmapped_names)}')
+        lines.append(quantization_markdown(report))
     lines += [f'- **Axis size:** {c.a_size} → {c.b_size}: {c.tensors} tensors'
               for c in d.axis_changes]
     return overview_sentence(report) + '\n\n' + '\n'.join(lines)
@@ -241,6 +299,31 @@ def samples_markdown(report):
     description = f'{count} of {total} candidate tensors sampled.'
     if count < total:
         description += ' Names were evenly subsampled.'
+    if report.a.format == 'gguf' or report.b.format == 'gguf':
+        description += ('\n\nSamples align to quantization blocks (first and middle 2,048 elements). '
+            'Same-typed GGUF pairs compare exact block bytes. Other pairs are dequantized to float32. '
+            'same_after_requant: the original quantized to B’s dtype matches exactly. '
+            'Expected noise e_exp comes from quantizing and restoring A’s samples to B’s dtype. '
+            'The threshold is 1e-5 when e_exp = 0, otherwise max(2 × e_exp, e_exp + 0.005). '
+            'Unsupported encoders fall back to B’s '
+            'per-dtype median/MAD, explicitly marked below. Different GGUF dtypes use the larger floor. '
+            'Above-threshold samples are checked for element transforms (−x, x+1, x−1, −exp(x), exp(x), log(x) '
+            'on positive A values), then one permutation of intact head-sized column groups inferred '
+            'by minimum unsorted relative error on the first complete row, with no reused A groups, '
+            'and applied unchanged to the middle and last rows. Group sizes come from config/GGUF '
+            'head dimensions, or 64/128/256 when absent. Row permutations compare unsorted rows '
+            'against distinct A rows and may additionally read A tensors of at most 32 MiB. '
+            'Each transform is also checked in combination with rearrangement. Only 1D samples compare '
+            'sorted values, at a threshold of at most 1e-5. Matches are same_after_transform or rearranged; '
+            'other samples are beyond_quant_noise. '
+            'Three or more sampled layers of the same name kind, all beyond with error MAD/median < 0.2, '
+            'are systematic: uniform differences across sampled layers (retraining or an unknown transform). '
+            'Both beyond_quant_noise and systematic count as differences. Unsampled layers are not inferred. '
+            'These checks do not prove unchanged weights.\n\n')
+        description += quantization_markdown(report) + '\n\n'
+        description += _table(['Tensor', 'Result', 'Relative error', 'Expected errors (A)', 'Transform', 'Detail'],
+            [(s.name, s.status, s.relative_error, s.expected_errors, s.transform, s.reason) for s in report.samples], limit=50)
+        return description
     description += '\n\nEach sample uses the first 2,048 elements and, for tensors with more than 8,192 elements, the middle 2,048 elements. '
     description += 'Same dtype: same = the sampled bytes are identical. '
     description += 'Different floating dtypes: same = sampled values are the same (within dtype-conversion rounding). '

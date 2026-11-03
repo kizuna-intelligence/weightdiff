@@ -4,7 +4,7 @@ from difflib import SequenceMatcher
 
 from .model import FingerprintCount, LayerStackSummary, ModelSnapshot
 
-LAYER = re.compile(r'(^|\.)layers\.(\d+)\.')
+LAYER = re.compile(r'(^|\.)(?:layers|blk)\.(\d+)\.')
 
 
 def layer_parts(name):
@@ -22,7 +22,10 @@ def layer_type(name):
 
 def _stacks(snapshot):
     stacks = defaultdict(lambda: defaultdict(list))
+    unmapped = set(snapshot.unmapped_names)
     for name, tensor in snapshot.tensors.items():
+        if name in unmapped:
+            continue
         parts = layer_parts(name)
         if parts:
             prefix, number, suffix = parts
@@ -63,6 +66,8 @@ def summarize_layers(a: ModelSnapshot, b: ModelSnapshot) -> list[LayerStackSumma
         prefix = f'{pa} → {pb}' if pa and pb and pa != pb else pa or pb
         la, lb = stacks_a.get(pa, []), stacks_b.get(pb, [])
         names_only = (pa, pb) in name_pairs
+        if a.format == 'gguf' or b.format == 'gguf':
+            names_only = bool(pa and pb)
         if names_only:
             la, lb = fingerprints(la, True), fingerprints(lb, True)
         fa, fb = [x[1] for x in la], [x[1] for x in lb]

@@ -68,3 +68,14 @@ def read_ranges(repo, revision, filename, ranges) -> list[bytes]:
                 raise ValueError('Truncated sample range')
             result.append(data)
     return result
+
+
+def file_size(repo, revision, filename):
+    return local_path(repo, filename).stat().st_size
+
+
+def read_prefix(repo, revision, filename, length):
+    with local_path(repo, filename).open('rb') as file:
+        data = file.read(length)
+    count('header_bytes', len(data))
+    return data

@@ -1,3 +1,4 @@
+import re
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import replace
@@ -7,14 +8,82 @@ from time import perf_counter
 from ..domain.compare import compare_samples, diff_config, diff_files, diff_tensors, plan_samples, sample_pairs
 from ..domain.flags import make_flags
 from ..domain.layers import summarize_layers
+from ..domain.quant import (compare_quant_sample, classify_quant_samples, native_calibration_inputs,
+                            plan_rearrangement, compare_rearrangement, column_group_sizes)
 from ..domain.model import ModelSnapshot, Report, TensorInfo
-from ..external import hub, local
+from ..external import hub, local, gguf, gguf_names, ggml
 from ..external._io import start_counting, stop_counting
 
 
-def _source(ref):
-    # The sole local/Hub dispatch point, shared by collection and sampling.
-    return local if Path(ref).is_dir() else hub
+def _location(ref):
+    # All local/Hub and safetensors/GGUF dispatch lives in the application.
+    if ref.lower().endswith('.gguf'):
+        if ':' in ref and not Path(ref).is_file():
+            repo, filename = ref.split(':', 1)
+            if not repo or not filename:
+                raise ValueError('Use repo_id:path/to/file.gguf')
+            return hub, repo, filename
+        path = Path(ref).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f'Local GGUF file does not exist: {ref}')
+        return local, str(path.parent), path.name
+    return (local if Path(ref).is_dir() else hub), ref, None
+
+
+def _gguf_snapshot(ref, revision, source, repo, filename):
+    revision = source.resolve_revision(repo, revision)
+    available = source.list_files(repo, revision)
+    match = re.fullmatch(r'(.*)-(\d{5})-of-(\d{5})\.gguf', filename)
+    if match:
+        base, number, count = match.groups()
+        if not 1 <= int(number) <= int(count):
+            raise ValueError('Invalid split GGUF shard number/count')
+        files = [f'{base}-{i:05d}-of-{int(count):05d}.gguf' for i in range(1, int(count) + 1)]
+        if any(name not in available for name in files):
+            raise ValueError('Incomplete split GGUF: not all shards are present')
+    else:
+        files = [filename]
+    def read(name):
+        size = source.file_size(repo, revision, name)
+        return name, gguf.read_header(lambda length: source.read_prefix(repo, revision, name, length), size)
+    tensors, metadata = {}, None
+    for name, header in _parallel(read, files):
+        if metadata is not None:
+            arch = metadata.get('general.architecture')
+            for key in ('general.architecture', f'{arch}.block_count', f'{arch}.embedding_length'):
+                if metadata.get(key) != header['metadata'].get(key):
+                    raise ValueError(f'Inconsistent split GGUF metadata: {key}')
+        else:
+            metadata = header['metadata']
+        for tensor_name, item in header['tensors'].items():
+            if tensor_name in tensors:
+                raise ValueError(f'Duplicate GGUF tensor across shards: {tensor_name}')
+            tensors[tensor_name] = TensorInfo(tensor_name, item['dtype'], item['shape'],
+                                             item['nbytes'], name, item['data_start'])
+    config = gguf.config_from_gguf(metadata)
+    tokenizer = {'chat_template': metadata['tokenizer.chat_template']} if 'tokenizer.chat_template' in metadata else None
+    return ModelSnapshot(ref, revision, tuple(files), config, tokenizer, tensors, (), 'gguf')
+
+
+def _align_gguf_names(a, b):
+    if a.format == b.format:
+        return a, b
+    hf, quantized = (a, b) if b.format == 'gguf' else (b, a)
+    config = quantized.config or {}
+    mapping = gguf_names.map_names(hf.tensors, quantized.tensors,
+                                   config.get('model_type'), config.get('num_hidden_layers', 0))
+    reverse = {gg: name for name, gg in mapping.items()}
+    tensors = {}
+    for original, tensor in quantized.tensors.items():
+        name = reverse.get(original, original)
+        if name in tensors:
+            raise ValueError(f'Ambiguous GGUF name correspondence: {name}')
+        tensors[name] = replace(tensor, name=name)
+    quantized = replace(quantized, tensors=tensors,
+        original_names={name: original for original, name in reverse.items()},
+        unmapped_names=tuple(sorted(quantized.tensors.keys() - reverse.keys())))
+    hf = replace(hf, unmapped_names=tuple(sorted(hf.tensors.keys() - mapping.keys())))
+    return (hf, quantized) if b.format == 'gguf' else (quantized, hf)
 
 
 def _parallel(fn, items):
@@ -24,7 +93,9 @@ def _parallel(fn, items):
 
 
 def snapshot(ref, revision=None) -> ModelSnapshot:
-    source = _source(ref)
+    source, repo, filename = _location(ref)
+    if filename is not None:
+        return _gguf_snapshot(ref, revision, source, repo, filename)
     revision = source.resolve_revision(ref, revision)
     files = tuple(sorted(source.list_files(ref, revision)))
     small_names = [f for f in ('config.json', 'tokenizer_config.json', 'model.safetensors.index.json',
@@ -95,22 +166,29 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
         a = snapshot(a_ref, a_rev)
         update(.15, 'Reading model B metadata and headers')
         b = snapshot(b_ref, b_rev)
+        a, b = _align_gguf_names(a, b)
         layers = summarize_layers(a, b)
         tensors = diff_tensors(a, b, layers)
         candidates = sample_pairs(a, b, tensors, layers)
         plans = plan_samples(a, b, candidates, max_tensors, layers) if sample else []
-        sources = _source(a.ref), _source(b.ref)
+        locations = _location(a.ref), _location(b.ref)
         def read_pair(plan):
+            compare = compare_quant_sample if plan.mode == 'quant' else compare_samples
             if plan.skip_reason:
-                return compare_samples(plan, None, None)
+                return compare(plan, None, None)
             data = []
-            for snap, source, filename, ranges in [(a, sources[0], plan.a_file, plan.a_ranges),
-                                                    (b, sources[1], plan.b_file, plan.b_ranges)]:
+            for snap, location, filename, ranges in [(a, locations[0], plan.a_file, plan.a_ranges),
+                                                    (b, locations[1], plan.b_file, plan.b_ranges)]:
+                source, repo, _ = location
                 try:
-                    data.append(source.read_ranges(snap.ref, snap.revision, filename, ranges))
+                    data.append(source.read_ranges(repo, snap.revision, filename, ranges))
                 except Exception as exc:
                     data.append(f'{type(exc).__name__}: {exc}')
-            return compare_samples(plan, *data)
+            if plan.mode == 'quant':
+                native = {dtype: ggml.roundtrip(values, dtype)
+                          for dtype, values in native_calibration_inputs(plan, *data).items()}
+                return compare_quant_sample(plan, *data, roundtrips=native)
+            return compare(plan, *data)
         update(.3, f'Sampling {len(plans)} tensors')
         samples = []
         with ThreadPoolExecutor(max_workers=16) as executor:
@@ -118,10 +196,45 @@ def build_report(a_ref, b_ref, a_rev=None, b_rev=None, sample=True, max_tensors=
             for i, future in enumerate(futures):
                 samples.append(future.result())
                 update(.3 + .65 * (i + 1) / len(plans), f'Sampled {i+1}/{len(plans)} tensors')
+        # Calibrate before additional reads; conversion/permutation checks precede
+        # grouping into systematic differences.
+        samples, noise = classify_quant_samples(samples, systematic=False)
+        pairs = dict(candidates)
+        group_sizes = column_group_sizes(a.config, b.config)
+        def check_rearrangement(item):
+            plan, result = item
+            if result.status != 'beyond_quant_noise' or plan.mode != 'quant':
+                return result
+            name = plan.name.split(' → ', 1)[0]
+            other = pairs.get(name, name)
+            ta, tb = a.tensors[name], b.tensors[other]
+            rows = plan_rearrangement(ta, tb, plan)
+            if rows is None:
+                return result
+            try:
+                reads = []
+                for snap, location, filename, ranges in [
+                    (a, locations[0], rows.a_file, rows.a_ranges),
+                    (b, locations[1], rows.b_file, rows.b_ranges),
+                ]:
+                    source, repo, _ = location
+                    reads.append(source.read_ranges(repo, snap.revision, filename, ranges))
+                checked = compare_rearrangement(result, rows, *reads, group_sizes=group_sizes)
+                if checked.status == 'rearranged' or len(ta.shape) != 2 or ta.nbytes > 32 * 1024 * 1024:
+                    return checked
+                source, repo, _ = locations[0]
+                full_a = source.read_ranges(repo, a.revision, ta.file, ((ta.data_start, ta.nbytes),))
+                return compare_rearrangement(result, rows, *reads, full_a=full_a, group_sizes=group_sizes)
+            except Exception as exc:
+                return replace(result, reason=result.reason +
+                               f'; rearrangement check unavailable ({type(exc).__name__}: {exc})')
+        update(.96, 'Checking transformations and row/column rearrangements')
+        samples = _parallel(check_rearrangement, zip(plans, samples))
+        samples, noise = classify_quant_samples(samples)
         stats = dict(counter.values)
         stats['total_bytes'] = sum(stats[k] for k in ('header_bytes', 'sample_bytes', 'small_file_bytes'))
         report = Report(a, b, diff_config(a.config, b.config), layers, tensors, tuple(samples),
-                        diff_files(a.files, b.files), [], perf_counter() - started, stats, sample, len(candidates))
+                        diff_files(a.files, b.files), [], perf_counter() - started, stats, sample, len(candidates), noise)
         report = replace(report, flags=make_flags(report))
         update(1, 'Comparison complete')
         return report

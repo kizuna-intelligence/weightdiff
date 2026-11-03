@@ -4,6 +4,7 @@ from math import prod
 
 import numpy as np
 
+from .quant import plan_quant_sample
 from .layers import layer_parts
 from .model import AxisChange, ConfigChange, FileDiff, SamplePlan, SampleResult, TensorDiff
 
@@ -147,6 +148,14 @@ def plan_samples(a, b, same_meta, max_tensors=160, layer_summary=()) -> list[Sam
     for na, nb in pairs:
         ta, tb = a.tensors[na], b.tensors[nb]
         top_left = is_wider(ta.shape, tb.shape)
+        pa, pb = layer_parts(na), layer_parts(nb)
+        stack = next((s for s in layer_summary if pa and pb and s.a_prefix == pa[0]
+                      and s.b_prefix == pb[0]), None)
+        if a.format == 'gguf' or b.format == 'gguf':
+            plans.append(plan_quant_sample(ta, tb, na if na == nb else f'{na} → {nb}',
+                a.format, b.format, stack.prefix if stack else None,
+                (pa[1], pb[1]) if stack else None))
+            continue
         reason = None
         if ta.dtype not in FLOAT_SIZES or tb.dtype not in FLOAT_SIZES:
             reason = 'This dtype cannot be compared / この型は比べられません'

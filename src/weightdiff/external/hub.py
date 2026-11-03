@@ -106,3 +106,14 @@ def read_ranges(repo, revision, filename, ranges) -> list[bytes]:
         raise ValueError('Sample ranges must have nonnegative starts and lengths')
     return [_range(repo, revision, filename, start, length, 'sample_bytes') if length else b''
             for start, length in ranges]
+
+
+def file_size(repo, revision, filename):
+    size = _retry(lambda: get_hf_file_metadata(hf_hub_url(repo, filename, revision=revision))).size
+    if size is None:
+        raise ValueError(f'{filename}: file size is unavailable')
+    return size
+
+
+def read_prefix(repo, revision, filename, length):
+    return _range(repo, revision, filename, 0, length, 'header_bytes')

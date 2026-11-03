@@ -8,7 +8,7 @@ import gradio as gr
 
 from .collect import build_report
 from .report import (DISCLAIMER, position_notes, flags_markdown, layer_rows, metric_cards,
-                     overview_markdown, read_footer, samples_markdown, tensor_rows, to_json)
+                     overview_markdown, read_footer, samples_markdown, tensor_rows, to_json, quantization_markdown)
 
 DASHBOARD_CSS = '''
 .gradio-container {
@@ -98,8 +98,8 @@ INTRO_HTML = f'''
 <div class="wd-explanations">
     <section>
         <h2>What it reads <span class="wd-ja" lang="ja">/ 読むもの</span></h2>
-        <p>Only file headers and a few KB of samples per tensor.</p>
-        <p class="wd-ja" lang="ja">ファイルの頭と、数字の表ごとに数 KB の抜き取りだけ。</p>
+        <p>Only file headers and small samples per tensor (a few MB to a few hundred MB for a 4B model; never the full weights).</p>
+        <p class="wd-ja" lang="ja">ファイルの頭と、数字の表ごとの小さな抜き取りだけ（4B のモデルで数 MB〜数百 MB。重み全体は読みません）。</p>
     </section>
     <section>
         <h2>What it shows <span class="wd-ja" lang="ja">/ 分かること</span></h2>
@@ -119,21 +119,24 @@ EXAMPLE_CAPTIONS = [
     'Same model twice — nothing differs.',
     'A normal fine-tune — same structure, many values retrained.',
     'Same family name, but widened 2560 → 3968 and 11 layers added.',
+    'A Q8_0 GGUF of the same model — compare with quantization noise in mind.',
+    'A Q4_K_M GGUF of the same model — compare with quantization noise in mind.',
+    'A Q8_0 GGUF of the fine-tuned model — compare sampled values after dequantization.',
 ]
 
 EXAMPLES = [
     ('Identical', 'Qwen/Qwen3.5-4B', 'Qwen/Qwen3.5-4B'),
     ('Fine-tuned', 'Qwen/Qwen3.5-4B', 'ccore/Qwen3.5-4B-3D-Coder'),
     ('Widened + extra layers', 'Qwen/Qwen3.5-4B', 'divagr1925/Qwen3.5-4B-Qwenputer'),
+    ('GGUF Q8_0', 'Qwen/Qwen3.5-4B', 'unsloth/Qwen3.5-4B-GGUF:Qwen3.5-4B-Q8_0.gguf'),
+    ('GGUF Q4_K_M', 'Qwen/Qwen3.5-4B', 'unsloth/Qwen3.5-4B-GGUF:Qwen3.5-4B-Q4_K_M.gguf'),
+    ('Fine-tuned GGUF', 'Qwen/Qwen3.5-4B', 'ccore/Qwen3.5-4B-3D-Coder:Qwen3.5-4B-3D-Coder-Q8_0.gguf'),
 ]
 
 
 def compare(a, b, rev_a, rev_b, sample, progress=gr.Progress()):
     if not a.strip() or not b.strip():
-        raise gr.Error('Enter both model IDs.')
-    # A public Space accepts Hub IDs only; local folders remain available in CLI.
-    if os.environ.get('SPACE_ID') and (Path(a).exists() or Path(b).exists()):
-        raise gr.Error('Use Hugging Face model IDs in this Space.')
+        raise gr.Error('Enter both model references.')
     try:
         report = build_report(a.strip(), b.strip(), rev_a.strip() or None, rev_b.strip() or None,
                               sample=sample, progress=progress)
@@ -151,7 +154,7 @@ def compare(a, b, rev_a, rev_b, sample, progress=gr.Progress()):
     tensor_note = (f'{d.excluded_by_layer_shift} tensor names excluded from name comparison because layer counts differ. '
                    f'Parameters: A {d.a_parameters:,} · B {d.b_parameters:,}. '
                    'Showing the first 50 differences; download JSON for all.')
-    return (metric_cards(report), overview_markdown(report), flags_markdown(report),
+    return (metric_cards(report), overview_markdown(report) + ('\n\n' + quantization_markdown(report) if report.a.format == 'gguf' or report.b.format == 'gguf' else ''), flags_markdown(report),
             layer_rows(report, changed_limit=8), position_notes(report), tensor_rows(report)[:50], tensor_note,
             [[c.key, str(c.a_value), str(c.b_value), c.kind] for c in report.config_diff],
             files, samples_markdown(report), download, read_footer(report))
@@ -164,7 +167,7 @@ with gr.Blocks(title='weightdiff', analytics_enabled=False) as demo:
         with gr.Column(min_width=250):
             a = gr.Textbox(label='Model A', value='Qwen/Qwen3.5-4B')
         with gr.Column(min_width=250):
-            b = gr.Textbox(label='Model B', placeholder='Hugging Face model ID')
+            b = gr.Textbox(label='Model B', placeholder='Hub model ID, repo:file.gguf, local folder or .gguf path')
     with gr.Accordion('Revisions (optional)', open=False):
         with gr.Row():
             rev_a = gr.Textbox(label='Revision A')
@@ -173,12 +176,13 @@ with gr.Blocks(title='weightdiff', analytics_enabled=False) as demo:
         sample = gr.Checkbox(label='Also compare sampled values', value=True, scale=2)
         run = gr.Button('Compare', variant='primary', scale=1)
     gr.Markdown('Examples — click to run a comparison:')
-    with gr.Row():
-        examples = []
-        for (label, left, right), caption in zip(EXAMPLES, EXAMPLE_CAPTIONS):
-            with gr.Column(min_width=200):
-                examples.append((gr.Button(label), left, right))
-                gr.HTML(f'<p class="wd-example-caption">{caption}</p>')
+    examples = []
+    for offset in (0, 3):
+        with gr.Row():
+            for (label, left, right), caption in zip(EXAMPLES[offset:offset + 3], EXAMPLE_CAPTIONS[offset:offset + 3]):
+                with gr.Column(min_width=200):
+                    examples.append((gr.Button(label), left, right))
+                    gr.HTML(f'<p class="wd-example-caption">{caption}</p>')
     cards = gr.HTML(elem_id='wd-cards')
     summary = gr.Markdown(elem_id='wd-overview')
     gr.Markdown('## Points to note')
@@ -204,3 +208,12 @@ with gr.Blocks(title='weightdiff', analytics_enabled=False) as demo:
             compare, [a, b, rev_a, rev_b, sample], outputs, concurrency_limit=1)
 
 demo.queue(default_concurrency_limit=1)
+
+
+
+def main():
+    demo.launch(server_name="127.0.0.1", css=DASHBOARD_CSS)
+
+
+if __name__ == '__main__':
+    main()

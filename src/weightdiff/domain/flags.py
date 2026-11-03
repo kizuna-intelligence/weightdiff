@@ -51,6 +51,6 @@ def make_flags(report_parts) -> list[Flag]:
     changed = sum(s.status == 'different' for s in report_parts.samples)
     if changed:
         flags.append(Flag('info', f'値が書き換えられたテンソルが {changed} 個（抜き取りの範囲で）', ''))
-    if not any(f.endswith('.safetensors') for f in b.files):
+    if b.format != 'gguf' and not any(f.endswith('.safetensors') for f in b.files):
         flags.append(Flag('info', 'safetensors が無いので、この道具では中身を比べられません', ''))
     return flags

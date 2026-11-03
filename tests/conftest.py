@@ -1,5 +1,6 @@
 import json
 
+import gguf
 import numpy as np
 import pytest
 from safetensors.numpy import save_file
@@ -35,4 +36,33 @@ def model_factory(tmp_path):
         if template is not None:
             (root / 'chat_template.jinja').write_text(template)
         return root
+    return make
+
+
+@pytest.fixture
+def model_pair(tmp_path):
+    def make(transform, dtype='Q8_0', shape=(16, 256), count=1):
+        rng = np.random.default_rng(20)
+        folder = tmp_path / 'original'
+        folder.mkdir()
+        tensors = {}
+        target = tmp_path / 'converted.gguf'
+        writer = gguf.GGUFWriter(target, 'llama')
+        writer.add_block_count(count)
+        writer.add_embedding_length(shape[-1])
+        qtype = gguf.GGMLQuantizationType[dtype]
+        for i in range(count):
+            name = f'model.layers.{i}.self_attn.q_proj.weight'
+            values = rng.normal(0, .25, shape).astype(np.float32)
+            tensors[name] = values
+            changed = np.ascontiguousarray(transform(values, i), dtype=np.float32)
+            packed = gguf.quants.quantize(changed, qtype)
+            writer.add_tensor(f'blk.{i}.attn_q.weight', packed, raw_dtype=qtype)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        save_file(tensors, str(folder / 'model.safetensors'))
+        (folder / 'config.json').write_text(json.dumps({'model_type':'llama', 'num_hidden_layers':count}))
+        return str(folder), str(target)
     return make
